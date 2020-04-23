@@ -4,8 +4,11 @@ Example of how to use this:
 
 First:
 
-$ pip3 install -r requirements.txt
-$ vim config.yaml
+$ pip3 install -r requirements.txt  
+$ vim config.yaml  
+$ python3 eventador_cli.py  
+  
+NOTE: this requires python 3.6 or greater, probably.
 
 .. and set your login and password
 
