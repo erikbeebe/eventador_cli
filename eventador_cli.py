@@ -15,6 +15,17 @@ import sys
 import time
 import yaml
 
+USE_PYGMENTS = False
+
+try:
+    from pygments import highlight
+    from pygments.lexers import JsonLexer
+    from pygments.formatters import TerminalTrueColorFormatter
+
+    USE_PYGMENTS = True
+except:
+    pass
+
 # configure readline support for input
 readline.parse_and_bind('tab: complete')
 readline.parse_and_bind('set editing-mode vi')
@@ -170,7 +181,14 @@ class EventadorQuery(object):
                 if 'msg' in data:
                     out = json.loads(data['msg'])
                     wayout = json.loads(out)
-                    pprint(wayout)
+                    if USE_PYGMENTS:
+                        print(highlight(
+                            json.dumps(wayout, indent=4, sort_keys=True),
+                            lexer=JsonLexer(),
+                            formatter=TerminalTrueColorFormatter(style="monokai")))
+                    else:
+                        # default to plain ascii output
+                        pprint(wayout)
                 else:
                     print("Invalid message received in results - skipping.")
 
