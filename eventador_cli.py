@@ -9,7 +9,9 @@ import random
 import requests
 import sys
 import readline
+import signal
 import socketio
+import sys
 import time
 import yaml
 
@@ -30,21 +32,6 @@ except Exception as ex:
     sys.exit(1)
 print("done.")
 
-sio = socketio.Client()
-
-@sio.on('kafkacatOutput')
-def receive_kafkacat_data(data):
-    if 'msg' in data:
-        out = json.loads(data['msg'])
-        wayout = json.loads(out)
-        pprint(wayout)
-    else:
-        print("Invalid message received in results - skipping.")
-
-@sio.event
-def receive_ws_data(data):
-    print("NEW MESSAGE ARRIVED: {}".format(data))
-
 
 class NoCSRFTokenFound(Exception):
     pass
@@ -57,10 +44,25 @@ class EventadorQuery(object):
         self.clusters = {}
         self.selected_cluster = None
         self.selected_cluster_name = None
+        self.current_query = {}
+        self.room_name = None
 
         # SocketIO configuration
-        self.sio = sio
+        self.sio = socketio.Client()
         self.sio.eio.http = self.session
+
+        signal.signal(signal.SIGINT, self.signal_handler)
+        self.register_handlers()
+
+        self.stop_output = False
+
+    # Handle user break signal
+    def signal_handler(self, sig, frame):
+        print("Aborting output.")
+        self.stop_output = True
+        self.sio.emit('leave', {'room': self.room_name})
+        self.sio.disconnect()
+        self.kill_query()
 
     def get_csrf_token(self):
         print("Getting CSRF token..")
@@ -120,18 +122,37 @@ class EventadorQuery(object):
         headers = {'x-csrf-token': self.csrf_token}
         #r = self.session.post(BASE_URL + '/api/v1/sb-run/{}'.format(self.selected_cluster), data = json.dumps(payload, default=str), headers = headers)
         r = self.session.post(BASE_URL + '/api/v1/sb-run/{}'.format(self.selected_cluster), json = payload, headers = headers)
+
+        self.current_query = r.json()
+
         print("Executed query: {}".format(r.text))
         return r.json()
 
+    def kill_query(self, jobid=None):
+        headers = {'x-csrf-token': self.csrf_token}
+
+        if not jobid:
+            # kill currently running query
+            jobid = self.current_query['data']['jobid']
+
+        payload = {'deploymentid': self.selected_cluster, 'jobid': jobid}
+
+        r = self.session.post(BASE_URL + '/api/v1/sb_job_cancel', json = payload, headers = headers)
+
+        print("Killed job: {}".format(r.json().get('message')))
+        return r.json()
+
     def sample_query(self, sink_id):
+        self.stop_output = False
+
         self.sio.connect(WSS_URL)
         print("sink id: {}".format(sink_id))
         # need to know the sink id returned from the job start
-        room_name = "SQL_RESULTS-" + hashlib.md5(str(sink_id + random.randint(0,2**31-1)).encode('utf-8')).hexdigest()
-        self.sio.emit('join', {'room': room_name})
+        self.room_name = "SQL_RESULTS-" + hashlib.md5(str(sink_id + random.randint(0,2**31-1)).encode('utf-8')).hexdigest()
+        self.sio.emit('join', {'room': self.room_name})
 
         params = {'sink_id': sink_id,
-                  'room': room_name,
+                  'room': self.room_name,
                   'deploymentid': self.selected_cluster}
         self.sio.emit('kafkacat_results', params)
 
@@ -139,6 +160,24 @@ class EventadorQuery(object):
         self.sio.emit('keepalive', {'sink_id': sink_id})
         self.sio.sleep(10)
         self.sio.wait()
+
+    def register_handlers(self):
+        sio = self.sio
+
+        @sio.on('kafkacatOutput')
+        def receive_kafkacat_data(data):
+            if not self.stop_output:
+                if 'msg' in data:
+                    out = json.loads(data['msg'])
+                    wayout = json.loads(out)
+                    pprint(wayout)
+                else:
+                    print("Invalid message received in results - skipping.")
+
+        @sio.event
+        def receive_ws_data(data):
+            print("NEW MESSAGE ARRIVED: {}".format(data))
+
 
 def require_cluster(f):
     @wraps(f)
@@ -215,7 +254,7 @@ def handle_query(query):
     print("Running job with query: {}".format(query))
 
     jobid = e.reserve_jobid()
-    print("jobid: {}".format(jobid))
+    print("Starting job id: {}".format(jobid))
 
     base64_encoded_query = base64.b64encode(query.encode('utf-8')).decode('utf-8')
 
