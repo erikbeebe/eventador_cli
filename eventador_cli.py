@@ -10,6 +10,7 @@ import requests
 import sys
 import readline
 import socketio
+import time
 import yaml
 
 # configure readline support for input
@@ -218,24 +219,28 @@ def handle_query(query):
 
     base64_encoded_query = base64.b64encode(query.encode('utf-8')).decode('utf-8')
 
+    job_basename = "api_testjob_" + str(int(time.time()))
+
     snapshot = {"is_create":False,
-                "name":"erik_testing_mview",
+                "name":job_basename + "_mview",
                 "retention":300,
                 "is_recreate":True,
                 "key_column_name":"",
                 "is_ignore_nulls":False,
-                "require_restart":False}
+                "require_restart":False,
+                "api_key": ""
+                }
 
     payload = {'sql': base64_encoded_query,
-               'source': 738,
+               'source': 0,
                'sink': None,
-               'job_name': 'erik_testing',
+               'job_name': job_basename,
                'sb_version': '6.0.1',
                'restart_strategy': 'never',
                'restart_retry_time': 30,
                'parallelism': 1,
-               'snapshot': snapshot,
-               'jobid': jobid}
+               'snapshot': snapshot
+               }
 
     result = e.run_query(payload)
 
@@ -267,4 +272,7 @@ print("Welcome to Eventador.  Enter a command, type 'help' for more information,
       "or press ctrl-d to exit.")
 
 while True:
-    query_repl(e)
+    try:
+        query_repl(e)
+    except Exception as ex:
+        print("Failed: {}".format(ex))
