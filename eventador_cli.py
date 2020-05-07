@@ -15,24 +15,12 @@ import sys
 import time
 import yaml
 
-USE_PYGMENTS = False
-
-try:
-    from pygments import highlight
-    from pygments.lexers import JsonLexer
-    from pygments.formatters import TerminalTrueColorFormatter
-
-    USE_PYGMENTS = True
-except:
-    pass
+from eventador.query import EventadorQuery
+from eventador import parser
 
 # configure readline support for input
 readline.parse_and_bind('tab: complete')
 readline.parse_and_bind('set editing-mode vi')
-
-#BASE_URL = "https://eventador.cloud"
-BASE_URL = "https://dev-one-use1.console.eventador.io"
-WSS_URL = "https://dev-one-use1.console.eventador.io"
 
 print("Loading configuration from config.yaml.. ", end='')
 try:
@@ -44,169 +32,6 @@ except Exception as ex:
 print("done.")
 
 
-class NoCSRFTokenFound(Exception):
-    pass
-
-class EventadorQuery(object):
-    def __init__(self):
-        self.session = requests.session()
-        self.csrf_token = None
-        self.deploymentid = None
-        self.clusters = {}
-        self.selected_cluster = None
-        self.selected_cluster_name = None
-        self.current_query = {}
-        self.room_name = None
-
-        # SocketIO configuration
-        self.sio = socketio.Client()
-        self.sio.eio.http = self.session
-
-        signal.signal(signal.SIGINT, self.signal_handler)
-        self.register_handlers()
-
-        self.stop_output = False
-
-    # Handle user break signal
-    def signal_handler(self, sig, frame):
-        print("Aborting output.")
-        self.stop_output = True
-        self.sio.emit('leave', {'room': self.room_name})
-        self.sio.disconnect()
-        self.kill_query()
-
-    def get_csrf_token(self):
-        print("Getting CSRF token..")
-        r = self.session.get(BASE_URL + '/login')
-        for line in r.iter_lines():
-            if b'name="csrf_token"' in line:
-                self.csrf_token = str(line.split()[4]).split('=')[1].replace('>','').replace('"','').replace("'",'').strip()
-                return
-        raise NoCSRFTokenFound()
-
-    def login(self, username, password):
-        if not self.csrf_token:
-            self.get_csrf_token()
-
-        r = self.session.post(BASE_URL + '/login', data = {'login': username, 'password': password, 'csrf_token': self.csrf_token, 'next': ''})
-        print("Login successful, user is: {}".format(username))
-
-    def get_tables(self):
-        r = self.session.get(BASE_URL + '/api/v1/sb-source/source')
-        raw_sources = r.json()
-
-        tables = []
-        for table in raw_sources['data']:
-            tables.append(table['table_name'])
-
-        return tables
-
-    def get_jobs(self):
-        r = self.session.get(BASE_URL + '/api/v1/sb-source/source')
-        raw_sources = r.json()
-
-        tables = []
-        for table in raw_sources['data']:
-            tables.append(table['table_name'])
-
-        return tables
-
-    def get_clusters(self):
-        r = self.session.get(BASE_URL + '/api/v1/deployments')
-        raw_deployments = r.json()
-
-        clusters = {}
-
-        for r in raw_deployments['data']:
-            name = r['deploymentname']
-            clusters[name] = {'name': r['deploymentname'], 'description': r['description'], 'id': r['deploymentid']}
-
-        self.clusters = clusters
-        return clusters
-
-    def reserve_jobid(self):
-        headers = {'x-csrf-token': self.csrf_token}
-        r = self.session.post(BASE_URL + '/api/v1/job/{}'.format(self.selected_cluster), json = {}, headers = headers)
-        return r.json()['data']['jobid']
-
-    def run_query(self, payload):
-        headers = {'x-csrf-token': self.csrf_token}
-        #r = self.session.post(BASE_URL + '/api/v1/sb-run/{}'.format(self.selected_cluster), data = json.dumps(payload, default=str), headers = headers)
-        r = self.session.post(BASE_URL + '/api/v1/sb-run/{}'.format(self.selected_cluster), json = payload, headers = headers)
-
-        self.current_query = r.json()
-
-        print("Executed query: {}".format(r.text))
-        return r.json()
-
-    def kill_query(self, jobid=None):
-        headers = {'x-csrf-token': self.csrf_token}
-
-        if not jobid:
-            # kill currently running query
-            jobid = self.current_query['data']['jobid']
-
-        payload = {'deploymentid': self.selected_cluster, 'jobid': jobid}
-
-        r = self.session.post(BASE_URL + '/api/v1/sb_job_cancel', json = payload, headers = headers)
-
-        print("Killed job: {}".format(r.json().get('message')))
-        return r.json()
-
-    def sample_query(self, sink_id):
-        self.stop_output = False
-
-        self.sio.connect(WSS_URL)
-        print("sink id: {}".format(sink_id))
-        # need to know the sink id returned from the job start
-        self.room_name = "SQL_RESULTS-" + hashlib.md5(str(sink_id + random.randint(0,2**31-1)).encode('utf-8')).hexdigest()
-        self.sio.emit('join', {'room': self.room_name})
-
-        params = {'sink_id': sink_id,
-                  'room': self.room_name,
-                  'deploymentid': self.selected_cluster}
-        self.sio.emit('kafkacat_results', params)
-
-        # need to run this every 5 seconds
-        self.sio.emit('keepalive', {'sink_id': sink_id})
-        self.sio.sleep(10)
-        self.sio.wait()
-
-    def register_handlers(self):
-        sio = self.sio
-
-        @sio.on('kafkacatOutput')
-        def receive_kafkacat_data(data):
-            if not self.stop_output:
-                if 'msg' in data:
-                    out = json.loads(data['msg'])
-                    wayout = json.loads(out)
-                    if USE_PYGMENTS:
-                        print(highlight(
-                            json.dumps(wayout, indent=4, sort_keys=True),
-                            lexer=JsonLexer(),
-                            formatter=TerminalTrueColorFormatter(style="monokai")))
-                    else:
-                        # default to plain ascii output
-                        pprint(wayout)
-                else:
-                    print("Invalid message received in results - skipping.")
-
-        @sio.event
-        def receive_ws_data(data):
-            print("NEW MESSAGE ARRIVED: {}".format(data))
-
-
-def require_cluster(f):
-    @wraps(f)
-    def wrapper(*args, **kwds):
-        if e.selected_cluster:
-            return f(*args, **kwds)
-        else:
-            print("No cluster selected - pick a cluster first with SET CLUSTER")
-            return None
-    return wrapper
-
 def query_repl(e):
     try:
         if e.selected_cluster:
@@ -217,92 +42,8 @@ def query_repl(e):
         print("\nGoodbye.")
         sys.exit(1)
 
-    # remove trailing semicolon
-    if i.lower().strip().endswith(';'):
-        i = i.lower().strip()[:-1]
+    p.parse(i)
 
-    if i.startswith('show') or i.startswith('set'):
-        handle_show_commands(i)
-    elif i.startswith('select'):
-        handle_query(i)
-    elif 'exit' == i.lower().strip():
-        print("Goodbye.")
-        sys.exit(1)
-    elif 'help' == i.lower().strip():
-        print(ev_help())
-    elif i.strip() == "":
-        # eg. if you press enter with no text
-        pass
-    else:
-        print("Invalid command.  Type help for help.")
-
-def handle_show_commands(cmd):
-    cmd = cmd.lower().strip()
-
-    if cmd == 'show tables':
-        tables = e.get_tables()
-        pprint(tables)
-    elif cmd == 'show clusters':
-        clusters = e.get_clusters()
-        print("%-40s %-40s" % ('Cluster name', 'Description'))
-        print("-"*80)
-        for c in clusters:
-            print("%-40s %-40s" % (clusters[c]['name'], clusters[c]['description']))
-        print("")
-    elif cmd.startswith('set cluster'):
-        if not e.clusters:
-            # if we haven't polled for a list of clusters yet,
-            # do that now
-            e.get_clusters()
-
-        name = cmd.split()[2]
-        if name in e.clusters:
-            print("Selected SSB cluster: {}".format(name))
-            e.selected_cluster = e.clusters[name].get('id')
-            e.selected_cluster_name = name
-        else:
-            print("Invalid cluster.")
-    elif cmd == 'show env':
-        print("Current cluster: {}".format(e.selected_cluster))
-    else:
-        print("Invalid command.  Type help for help.")
-
-@require_cluster
-def handle_query(query):
-    print("Running job with query: {}".format(query))
-
-    jobid = e.reserve_jobid()
-    print("Starting job id: {}".format(jobid))
-
-    base64_encoded_query = base64.b64encode(query.encode('utf-8')).decode('utf-8')
-
-    job_basename = "api_testjob_" + str(int(time.time()))
-
-    snapshot = {"is_create":False,
-                "name":job_basename + "_mview",
-                "retention":300,
-                "is_recreate":True,
-                "key_column_name":"",
-                "is_ignore_nulls":False,
-                "require_restart":False,
-                "api_key": ""
-                }
-
-    payload = {'sql': base64_encoded_query,
-               'source': 0,
-               'sink': None,
-               'job_name': job_basename,
-               'sb_version': '6.0.1',
-               'restart_strategy': 'never',
-               'restart_retry_time': 30,
-               'parallelism': 1,
-               'snapshot': snapshot
-               }
-
-    result = e.run_query(payload)
-
-    print("Waiting for results..")
-    e.sample_query(result['data']['ephemeral_sink_id'])
 
 def ev_help():
     """simple help screen."""
@@ -314,7 +55,7 @@ show tables
 show clusters
 set cluster <clusterName>
 
-Or enter any valid SQL query.  eg. 
+Or enter any valid SQL query.  eg.
 
 SELECT * FROM airplanes;
 ------------------------------------------------------------------------------
@@ -322,14 +63,27 @@ SELECT * FROM airplanes;
 
     return h
 
-e = EventadorQuery()
-e.login(config['auth']['username'], config['auth']['password'])
+
+# Initializing REPL loop
+
+BASE_URL = config['endpoint']['urlbase']
+WSS_URL = config['endpoint']['urlbase']
+
+ev = EventadorQuery(BASE_URL, WSS_URL)
+
+try:
+    ev.login(config['auth']['username'], config['auth']['password'])
+except NoCSRFTokenFound as ex:
+    print("Login failed - no CSRF token retrieved.")
+    sys.exit(1)
+
+p = parser.Parser(ev)
 
 print("Welcome to Eventador.  Enter a command, type 'help' for more information,"
       "or press ctrl-d to exit.")
 
 while True:
     try:
-        query_repl(e)
+        query_repl(p)
     except Exception as ex:
         print("Failed: {}".format(ex))
